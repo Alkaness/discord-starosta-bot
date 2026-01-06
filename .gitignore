@@ -1,0 +1,30 @@
+# Rust build artifacts
+/target/
+Cargo.lock
+
+# Environment variables (contains sensitive data)
+.env
+
+# JSON data files (contain user data, not for GitHub)
+*.json
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Deployment folders
+deploy/
+starosta_bot_deploy/
+
+# Discloud zip packages
+*.zip
+
+# Log files
+*.log
