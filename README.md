@@ -144,7 +144,7 @@ The bot automatically creates and manages these JSON files:
 - `suggestions_channels.json` - Ideas channel IDs
 - `suggestions_data.json` - Ideas and votes tracking
 
-## 🔧 Technical Details
+##  Technical Details
 
 - **Language**: Rust 2021 Edition
 - **Framework**: Poise (Discord bot framework)
@@ -180,5 +180,4 @@ This project is provided as-is for community use. Feel free to modify and adapt 
 ---
 
 **Version**: 2.0  
-**Status**: Production Ready ✅  
-**Made with**: 🦀 Rust + ❤️
+
