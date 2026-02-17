@@ -4,7 +4,7 @@ A feature-rich Discord bot built with Rust for managing Ukrainian community serv
 
 ##  Features
 
-### 🎮 Core Systems
+###  Core Systems
 - **XP & Leveling System** - Earn XP from messages and voice activity, level up to unlock roles
 - **Economy System** - Collect chips through daily rewards, work, casino, and level-ups
 - **XP Boosters** - Purchase temporary XP multipliers (x2, x5) from the shop
