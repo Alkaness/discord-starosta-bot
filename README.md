@@ -1,122 +1,172 @@
-#  StarostaBot - Discord Community Bot
+# StarostaBot
 
-A feature-rich Discord bot built with Rust for managing Ukrainian community servers with XP/leveling system, ideas management, tickets, birthdays, and more.
+[![CI](https://github.com/Alkaness/discord-starosta-bot/actions/workflows/ci.yml/badge.svg)](https://github.com/Alkaness/discord-starosta-bot/actions/workflows/ci.yml)
+[![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Discord](https://img.shields.io/badge/platform-Discord-5865F2.svg)](https://discord.com)
 
-##  Features
+A Discord community bot built in Rust for managing Ukrainian servers. Features an XP/leveling system, economy, moderation tools, idea voting, and birthday tracking.
 
-###  Core Systems
-- **XP & Leveling System** - Earn XP from messages and voice activity, level up to unlock roles
-- **Economy System** - Collect chips through daily rewards, work, casino, and level-ups
-- **XP Boosters** - Purchase temporary XP multipliers (x2, x5) from the shop
-- **Anti-Spam Protection** - Automatic spam detection with temporary cooldowns
+---
 
-###  Ideas & Suggestions System
-- Users write ideas in designated channels
-- Automatic embed creation with voting buttons (👍 Like / 👎 Dislike)
-- One vote per user, author cannot vote on their own ideas
-- Admins can approve/reject ideas
-- Authors can edit their suggestions via modal forms
-- Vote tracking and percentage calculations
+## Architecture
 
-###  Birthday System
-- Automatic birthday tracking and notifications
-- Special birthday role assignment
-- Sorted calendar view with month names
-- Admin commands for managing birthdays
+```
+starosta_bot/
+├── src/
+│   └── main.rs              # Application entry point (monolith)
+├── .github/
+│   └── workflows/
+│       └── ci.yml            # GitHub Actions CI pipeline
+├── Cargo.toml                # Dependencies and project metadata
+├── Cargo.lock                # Locked dependency versions
+├── discloud.config           # Discloud deployment configuration
+├── .env                      # Secrets (not committed)
+├── .env.example              # Environment variable template
+└── *.json                    # Runtime data files (not committed)
+```
 
-###  Moderation Tools
-- Mute system (text/voice/all channels)
-- Message cleanup commands
-- Banned words filter with automatic deletion
-- Role management for inactive users
-- Auto-role assignment on member join
+### Tech Stack
 
-###  Economy Features
-- Casino gambling system
-- Daily rewards (24h cooldown)
-- Work command for earning chips
-- XP booster shop (x2 and x5 multipliers)
+| Layer | Technology |
+|-------|-----------|
+| Language | Rust 2021 Edition |
+| Discord Framework | [Poise](https://github.com/serenity-rs/poise) (built on Serenity) |
+| Async Runtime | [Tokio](https://tokio.rs/) (multi-threaded) |
+| Serialization | Serde + serde_json |
+| Logging | tracing + tracing-subscriber |
+| Data Storage | Flat JSON files with mutex-guarded in-memory state |
 
-##  Quick Setup
+### Data Flow
+
+```
+Discord Gateway
+    │
+    ▼
+Event Handler (messages, interactions, member joins)
+    │
+    ├── XP / Leveling ──► users.json
+    ├── Moderation ────► banned_words.json
+    ├── Suggestions ───► suggestions_data.json
+    └── Birthdays ─────► birthdays.json
+
+Background Tasks (tokio::select!)
+    ├── Every 60s: Voice XP tick
+    ├── Every 1h:  Birthday announcements
+    └── Every 24h: Admin backup via DM
+```
+
+---
+
+## Features
+
+**Core Systems** -- XP and leveling with logarithmic scaling, economy (chips), XP boosters (x2/x5), anti-spam protection.
+
+**Ideas and Suggestions** -- Designated channels where user messages become voteable embeds with approve/reject admin controls, auto-created discussion threads, and author editing via modals.
+
+**Moderation** -- Text/voice/all muting, message purge, banned word filter with auto-delete, inactive role cleanup, auto-role on join.
+
+**Economy** -- Daily rewards, casino, blackjack, XP booster shop.
+
+**Birthdays** -- Automatic birthday tracking, role assignment, and server-wide announcements at 9 AM.
+
+---
+
+## Setup
 
 ### Prerequisites
-- Rust (latest stable version)
-- Discord Bot Token
-- Your Discord User ID (for admin commands)
 
-### Installation Steps
+- Rust (stable, 1.75+)
+- A Discord bot token ([Developer Portal](https://discord.com/developers/applications))
+- Your Discord user ID (enable Developer Mode, right-click profile, Copy ID)
 
-1. **Clone or download this repository**
+### Installation
 
-2. **Configure environment variables**
-   
-   Edit the `.env` file and add your credentials:
-   ```env
-   DISCORD_TOKEN=your_discord_bot_token_here
-   ADMIN_ID=your_user_id_here
-   ```
+```bash
+git clone https://github.com/Alkaness/discord-starosta-bot.git
+cd discord-starosta-bot
 
-   How to get these values:
-   - **Bot Token**: Go to [Discord Developer Portal](https://discord.com/developers/applications), create/select your application, go to "Bot" section, and copy the token
-   - **Admin ID**: Enable Developer Mode in Discord (User Settings > Advanced > Developer Mode), right-click your profile, and select "Copy ID"
+cp .env.example .env
+# Edit .env with your DISCORD_TOKEN and ADMIN_ID
 
-3. **Build the bot**
-   ```bash
-   cargo build --release
-   ```
+cargo build --release
+./target/release/rust_bot
+```
 
-4. **Run the bot**
-   ```bash
-   ./target/release/rust_bot
-   ```
+### Environment Variables
 
-##  Commands List
+| Variable | Description |
+|----------|------------|
+| `DISCORD_TOKEN` | Bot token from Discord Developer Portal |
+| `ADMIN_ID` | Your Discord user ID (receives daily backups) |
+
+---
+
+## Commands
 
 ### User Commands
-- `/help` - Display all available commands
-- `/info` - Bot information and statistics
-- `/profile [@user]` - View user profile with XP and level
-- `/rank` - Show XP leaderboard
-- `/daily` - Claim daily chips reward
-- `/work` - Work to earn chips
-- `/casino <amount>` - Gamble chips in casino
-- `/shop` - View XP booster shop
-- `/buy_booster <type>` - Purchase XP booster (x2 or x5)
-- `/birthdays` - View birthday calendar
+
+| Command | Description |
+|---------|------------|
+| `/help` | Show all available commands |
+| `/rank [@user]` | View profile with XP, level, and progress |
+| `/leaderboard` | Server leaderboard |
+| `/daily` | Claim daily chip reward (24h cooldown) |
+| `/casino <amount>` | Gamble chips |
+| `/blackjack <bet>` | Play blackjack |
+| `/shop` | View XP booster shop |
+| `/buy_booster <x2\|x5>` | Purchase a 24h XP booster |
+| `/set_birthday <day> <month>` | Set your birthday |
+| `/birthdays` | View birthday calendar |
+| `/poll <question>` | Create a vote |
+| `/avatar [@user]` | Show user avatar |
 
 ### Admin Commands
-- `/admin_set_level <user> <level>` - Set user level
-- `/admin_set_xp <user> <xp>` - Set user XP
-- `/admin_set_chips <user> <chips>` - Set user chips
-- `/admin_mute <user> <duration> [type]` - Mute user (text/voice/all)
-- `/admin_cleanup [amount]` - Delete bot messages
-- `/admin_add_birthday <user> <date>` - Add birthday (format: DD.MM)
-- `/admin_remove_birthday <user>` - Remove birthday
-- `/clean_roles` - Remove roles from inactive users
-- `/suggest` - Set current channel for ideas
-- `/unsuggest` - Disable ideas in current channel
 
-##  Key Features Explained
+| Command | Description |
+|---------|------------|
+| `/admin_set_level <user> <level>` | Set user level |
+| `/admin_set_xp <user> <xp>` | Set user XP |
+| `/admin_set_chips <user> <chips>` | Set user chips |
+| `/admin_mute <user> <minutes> [type]` | Mute (text/voice/all) |
+| `/admin_unmute <user>` | Unmute user |
+| `/admin_announce <channel> <text>` | Send announcement |
+| `/purge <amount>` | Delete messages (max 100) |
+| `/clean` | Delete bot messages |
+| `/setup_roles` | Create/update level roles |
+| `/setup_autorole <role>` | Set auto-role for new members |
+| `/suggest` / `/unsuggest` | Enable/disable ideas channel |
+| `/add_banned_word <word>` | Add filtered word |
+| `/cleanup_inactive <days>` | Strip roles from inactive users |
 
-### Ideas System Workflow
-1. Admin sets up ideas channel with `/suggest`
-2. Users post their ideas in that channel
-3. Bot automatically converts messages to embeds with voting buttons
-4. Community votes with 👍 (Like) or 👎 (Dislike)
-5. Admins can approve ✅ or reject ❌ ideas
-6. Authors can edit ✏️ their ideas using modal forms
+---
 
-### XP & Leveling
-- Earn **2 XP** per message (with anti-spam protection)
-- Earn **10 XP** per minute in voice channels
-- Level up formula: `level * 100 XP` required for next level
-- Unlock roles at specific levels
-- XP boosters multiply gains temporarily
+## XP and Leveling
 
-##  Deployment on Discloud
+XP is earned at **2 XP per message** and **10 XP per minute** in voice channels. Anti-spam prevents farming.
 
-### Configuration
-The bot includes `discloud.config` for easy deployment:
+The leveling formula uses a power-logarithmic curve:
+
+```
+XP needed = 100 * (level + 1)^1.3 * ln(level + 2) + 100
+```
+
+| Level | XP Required |
+|-------|------------|
+| 0 to 1 | 169 |
+| 5 to 6 | 2,098 |
+| 10 to 11 | 5,957 |
+| 20 to 21 | 16,822 |
+| 37 to 38 | 41,055 |
+
+Roles are unlocked at levels 0, 5, 10, 15, 20, 25, 30, 35, 40, 45, and 50.
+
+---
+
+## Deployment (Discloud)
+
+The project includes `discloud.config` for deployment on [Discloud](https://discloudbot.com/):
+
 ```
 NAME=StarostaBot
 TYPE=bot
@@ -128,56 +178,40 @@ BUILD=cargo build --release
 START=./target/release/rust_bot
 ```
 
-### Deployment Steps
-1. Create a zip file with all project files
-2. Make sure `.env` is configured with your credentials
-3. Upload to Discloud
-4. Bot will automatically build and start
-
-##  Data Files
-
-The bot automatically creates and manages these JSON files:
-- `users.json` - User profiles (XP, level, chips, boosters)
-- `birthdays.json` - Birthday tracking
-- `auto_roles.json` - Auto-role configuration
-- `banned_words.json` - Filtered words list
-- `suggestions_channels.json` - Ideas channel IDs
-- `suggestions_data.json` - Ideas and votes tracking
-
-##  Technical Details
-
-- **Language**: Rust 2021 Edition
-- **Framework**: Poise (Discord bot framework)
-- **Runtime**: Tokio (async runtime)
-- **Serialization**: Serde + serde_json
-- **Logging**: Tracing + tracing-subscriber
-
-### Dependencies
-- `poise` - Discord bot framework
-- `tokio` - Async runtime
-- `serde` / `serde_json` - Data serialization
-- `rand` - Random number generation
-- `chrono` - Date and time handling
-- `regex` - Regular expressions
-
-##  Security & Best Practices
-
--  Token stored in environment variables (not in code)
--  Admin ID configurable via environment
--  Anti-spam protection with cooldowns
--  Permission checks on all admin commands
--  Automatic data backups sent to admin daily
--  Error handling and logging
-
-##  Support & Contribution
-
-For issues, questions, or contributions, please create an issue or pull request in this repository.
-
-##  License
-
-This project is provided as-is for community use. Feel free to modify and adapt it to your server's needs.
+1. Create a zip containing: `src/`, `Cargo.toml`, `Cargo.lock`, `discloud.config`, and any JSON data files
+2. Set `DISCORD_TOKEN` and `ADMIN_ID` in Discloud environment variables
+3. Upload the zip to Discloud
 
 ---
 
-**Version**: 2.0  
+## CI/CD
 
+GitHub Actions runs on every push and PR to `main`:
+
+- **Check** -- `cargo check` for compilation errors
+- **Format** -- `cargo fmt` enforcement
+- **Clippy** -- Lint analysis with `-D warnings`
+- **Build** -- Release build verification
+
+See [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
+
+---
+
+## Data Files
+
+These JSON files are created at runtime and excluded from version control:
+
+| File | Purpose |
+|------|---------|
+| `users.json` | User profiles (XP, level, chips, boosters) |
+| `birthdays.json` | Birthday dates |
+| `auto_roles.json` | Auto-role configuration per guild |
+| `banned_words.json` | Filtered words list |
+| `suggestions_channels.json` | Designated idea channel IDs |
+| `suggestions_data.json` | Ideas, votes, and status tracking |
+
+---
+
+## License
+
+[MIT](LICENSE)

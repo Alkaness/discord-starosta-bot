@@ -38,6 +38,8 @@ const VOICE_XP_AMOUNT: u64 = 10;
 const MSG_XP_AMOUNT: u64 = 2;
 const BIRTHDAY_ROLE_NAME: &str = "誕生日 Іменинник 誕生日";
 
+
+
 // --- СТРУКТУРИ ДАНИХ ---
 fn default_chips() -> u64 { 100 }
 
@@ -121,6 +123,17 @@ fn get_roles_config() -> Vec<(u64, &'static str, u32)> {
 
 // --- ДОПОМІЖНІ ФУНКЦІЇ ---
 
+/// Safely lock a mutex, recovering from poisoning instead of panicking.
+fn safe_lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            warn!("⚠️ Mutex was poisoned, recovering...");
+            poisoned.into_inner()
+        }
+    }
+}
+
 fn load_json<T: for<'a> Deserialize<'a> + Default>(path: &str) -> T {
     match fs::read_to_string(path) {
         Ok(data) => {
@@ -158,7 +171,12 @@ fn save_json<T: Serialize>(path: &str, data: &T) {
 }
 
 fn get_xp_needed(level: u64) -> u64 {
-    5 * (level * level) + 50 * level + 100
+    // Power-logarithmic curve: combines exponential growth with log scaling.
+    // Formula: 100 * (level + 1)^1.3 * ln(level + 2) + 100
+    // Lv0→1: ~169 | Lv5→6: ~2098 | Lv10→11: ~5957 | Lv20→21: ~16822 | Lv37→38: ~41055
+    let level_f = level as f64;
+    let needed = 100.0 * (level_f + 1.0).powf(1.3) * (level_f + 2.0).ln() + 100.0;
+    needed as u64
 }
 
 fn try_levelup(profile: &mut UserProfile) -> Option<u64> {
@@ -316,7 +334,7 @@ async fn help(ctx: Context<'_>) -> Result<(), Error> {
 async fn info(ctx: Context<'_>) -> Result<(), Error> {
     let guild_count = ctx.serenity_context().cache.guilds().len();
     let user_count = {
-        let users = ctx.data().users.lock().unwrap();
+        let users = safe_lock(&ctx.data().users);
         users.len()
     };
     
@@ -350,7 +368,7 @@ async fn leaderboard(ctx: Context<'_>) -> Result<(), Error> {
     ctx.defer().await?;
     
     let mut leaders: Vec<(String, u64, u64, u64)> = {
-        let users = ctx.data().users.lock().unwrap();
+        let users = safe_lock(&ctx.data().users);
         users.iter()
             .map(|(id, p)| (id.clone(), p.level, p.xp, p.minutes))
             .collect()
@@ -487,7 +505,7 @@ async fn setup_roles(ctx: Context<'_>) -> Result<(), Error> {
 async fn admin_set_level(ctx: Context<'_>, user: serenity::User, level: u64) -> Result<(), Error> {
     let user_id = user.id.to_string();
     {
-        let mut users = ctx.data().users.lock().unwrap();
+        let mut users = safe_lock(&ctx.data().users);
         let profile = users.entry(user_id).or_insert(create_default_profile());
         profile.level = level;
         save_json(USERS_FILE, &*users);
@@ -506,7 +524,7 @@ async fn admin_set_level(ctx: Context<'_>, user: serenity::User, level: u64) -> 
 async fn admin_set_xp(ctx: Context<'_>, user: serenity::User, xp: u64) -> Result<(), Error> {
     let user_id = user.id.to_string();
     {
-        let mut users = ctx.data().users.lock().unwrap();
+        let mut users = safe_lock(&ctx.data().users);
         let profile = users.entry(user_id).or_insert(create_default_profile());
         profile.xp = xp;
         save_json(USERS_FILE, &*users);
@@ -521,7 +539,7 @@ async fn admin_set_xp(ctx: Context<'_>, user: serenity::User, xp: u64) -> Result
 async fn admin_set_chips(ctx: Context<'_>, user: serenity::User, chips: u64) -> Result<(), Error> {
     let user_id = user.id.to_string();
     {
-        let mut users = ctx.data().users.lock().unwrap();
+        let mut users = safe_lock(&ctx.data().users);
         let profile = users.entry(user_id).or_insert(create_default_profile());
         profile.chips = chips;
         save_json(USERS_FILE, &*users);
@@ -651,7 +669,7 @@ async fn avatar(ctx: Context<'_>, user: Option<serenity::User>) -> Result<(), Er
 async fn rank(ctx: Context<'_>, user: Option<serenity::User>) -> Result<(), Error> {
     let target = user.as_ref().unwrap_or_else(|| ctx.author());
     let (level, xp, minutes, chips) = {
-        let users = ctx.data().users.lock().unwrap();
+        let users = safe_lock(&ctx.data().users);
         match users.get(&target.id.to_string()) {
             Some(p) => (p.level, p.xp, p.minutes, p.chips),
             None => (0, 0, 0, 100),
@@ -683,7 +701,7 @@ async fn daily(ctx: Context<'_>) -> Result<(), Error> {
     let now = Utc::now().timestamp();
 
     let result = {
-        let mut users = ctx.data().users.lock().unwrap();
+        let mut users = safe_lock(&ctx.data().users);
         let profile = users.entry(user_id.clone()).or_insert(create_default_profile());
 
         if now - profile.last_daily < 86400 {
@@ -715,7 +733,7 @@ async fn casino(ctx: Context<'_>, amount: u64) -> Result<(), Error> {
     let user_id = ctx.author().id.to_string();
 
     let calc_result = {
-        let mut users = ctx.data().users.lock().unwrap();
+        let mut users = safe_lock(&ctx.data().users);
         let profile = users.entry(user_id).or_insert(create_default_profile());
 
         if profile.chips < amount || amount == 0 {
@@ -725,7 +743,7 @@ async fn casino(ctx: Context<'_>, amount: u64) -> Result<(), Error> {
                 profile.chips += amount;
                 Some((format!("🎰 Виграв **{} гривень**! 🤑", amount), true))
             } else {
-                profile.chips -= amount;
+                profile.chips = profile.chips.saturating_sub(amount);
                 Some((format!("🎰 Програв **{} гривень**. 📉", amount), false))
             }
         }
@@ -737,7 +755,7 @@ async fn casino(ctx: Context<'_>, amount: u64) -> Result<(), Error> {
         }
         Some((msg, _)) => {
             {
-                let users = ctx.data().users.lock().unwrap();
+                let users = safe_lock(&ctx.data().users);
                 save_json(USERS_FILE, &*users);
             }
             ctx.say(msg).await?;
@@ -752,7 +770,7 @@ async fn blackjack(ctx: Context<'_>, bet: u64) -> Result<(), Error> {
     let uid_str = ctx.author().id.to_string();
 
     let can_play = {
-        let users = ctx.data().users.lock().unwrap();
+        let users = safe_lock(&ctx.data().users);
         let p = users.get(&uid_str);
         if p.is_none() || p.unwrap().chips < bet || bet == 0 { false } else { true }
     };
@@ -786,11 +804,11 @@ async fn blackjack(ctx: Context<'_>, bet: u64) -> Result<(), Error> {
     while let Some(m) = msg.message().await?.await_component_interaction(&ctx.serenity_context().shard).timeout(Duration::from_secs(60)).await {
         if m.user.id != ctx.author().id { m.defer(&ctx.http()).await?; continue; }
         if m.data.custom_id == hit {
-            player.push(deck.pop().unwrap());
+            player.push(deck.pop().unwrap_or(10));
             if calc(&player) > 21 { ended = true; res = -1; }
         } else if m.data.custom_id == stand {
             ended = true;
-            while calc(&dealer) < 17 { dealer.push(deck.pop().unwrap()); }
+            while calc(&dealer) < 17 { if let Some(card) = deck.pop() { dealer.push(card); } else { break; } }
             let (ps, ds) = (calc(&player), calc(&dealer));
             if ds > 21 || ps > ds { res = 1; } else if ps < ds { res = -1; }
         }
@@ -799,9 +817,9 @@ async fn blackjack(ctx: Context<'_>, bet: u64) -> Result<(), Error> {
         if ended { break; }
     }
     if ended && res != 0 {
-        let mut users = ctx.data().users.lock().unwrap();
+        let mut users = safe_lock(&ctx.data().users);
         let p = users.entry(uid_str).or_insert(create_default_profile());
-        if res == 1 { p.chips += bet; } else { p.chips -= bet; }
+        if res == 1 { p.chips += bet; } else { p.chips = p.chips.saturating_sub(bet); }
         save_json(USERS_FILE, &*users);
     }
     Ok(())
@@ -812,7 +830,7 @@ async fn blackjack(ctx: Context<'_>, bet: u64) -> Result<(), Error> {
 async fn shop(ctx: Context<'_>) -> Result<(), Error> {
     let user_id = ctx.author().id.to_string();
     let (chips, x2_until, x5_until) = {
-        let users = ctx.data().users.lock().unwrap();
+        let users = safe_lock(&ctx.data().users);
         match users.get(&user_id) {
             Some(p) => (p.chips, p.xp_booster_x2_until, p.xp_booster_x5_until),
             None => (100, 0, 0),
@@ -863,7 +881,7 @@ async fn buy_booster(ctx: Context<'_>, booster_type: String) -> Result<(), Error
     };
     
     let result = {
-        let mut users = ctx.data().users.lock().unwrap();
+        let mut users = safe_lock(&ctx.data().users);
         let profile = users.entry(user_id.clone()).or_insert(create_default_profile());
         
         if profile.chips < price {
@@ -899,7 +917,7 @@ async fn set_birthday(ctx: Context<'_>, day: u32, month: u32) -> Result<(), Erro
     if NaiveDate::from_ymd_opt(2000, month, day).is_none() { ctx.say("❌ Дата не існує.").await?; return Ok(()); }
     let d = format!("{:02}.{:02}", day, month);
     {
-        let mut b = ctx.data().birthdays.lock().unwrap();
+        let mut b = safe_lock(&ctx.data().birthdays);
         b.insert(ctx.author().id.to_string(), d.clone());
         save_json(BIRTHDAY_FILE, &*b);
     }
@@ -911,7 +929,7 @@ async fn set_birthday(ctx: Context<'_>, day: u32, month: u32) -> Result<(), Erro
 #[poise::command(slash_command)]
 async fn birthdays(ctx: Context<'_>) -> Result<(), Error> {
     let birthdays_data = {
-        let b = ctx.data().birthdays.lock().unwrap();
+        let b = safe_lock(&ctx.data().birthdays);
         b.clone()
     };
     
@@ -949,7 +967,7 @@ async fn birthdays(ctx: Context<'_>) -> Result<(), Error> {
         if parts.len() == 2 {
             let day = parts[0];
             let month_num = parts[1].parse::<usize>().unwrap_or(1);
-            let month_name = months.get(month_num - 1).unwrap_or(&"???");
+            let month_name = if month_num > 0 { months.get(month_num - 1).unwrap_or(&"???") } else { &"???" };
             description.push_str(&format!("🎂 **{} {}** — <@{}>\n", day, month_name, user_id));
         }
     }
@@ -974,7 +992,7 @@ async fn admin_add_birthday(ctx: Context<'_>, user: serenity::User, day: u32, mo
     
     let date = format!("{:02}.{:02}", day, month);
     {
-        let mut b = ctx.data().birthdays.lock().unwrap();
+        let mut b = safe_lock(&ctx.data().birthdays);
         b.insert(user.id.to_string(), date.clone());
         save_json(BIRTHDAY_FILE, &*b);
     }
@@ -987,7 +1005,7 @@ async fn admin_add_birthday(ctx: Context<'_>, user: serenity::User, day: u32, mo
 #[poise::command(slash_command, default_member_permissions = "ADMINISTRATOR", rename = "admin_remove_birthday")]
 async fn admin_remove_birthday(ctx: Context<'_>, user: serenity::User) -> Result<(), Error> {
     let removed = {
-        let mut b = ctx.data().birthdays.lock().unwrap();
+        let mut b = safe_lock(&ctx.data().birthdays);
         let result = b.remove(&user.id.to_string());
         if result.is_some() {
             save_json(BIRTHDAY_FILE, &*b);
@@ -1014,7 +1032,7 @@ async fn setup_suggestions_channel(ctx: Context<'_>) -> Result<(), Error> {
     let channel_id = ctx.channel_id().to_string();
     
     {
-        let mut channels = ctx.data().suggestions_channels.lock().unwrap();
+        let mut channels = safe_lock(&ctx.data().suggestions_channels);
         if !channels.contains(&channel_id) {
             channels.push(channel_id.clone());
             save_json(SUGGESTIONS_CHANNELS_FILE, &*channels);
@@ -1034,7 +1052,7 @@ async fn remove_suggestions_channel(ctx: Context<'_>) -> Result<(), Error> {
     let channel_id = ctx.channel_id().to_string();
     
     let removed = {
-        let mut channels = ctx.data().suggestions_channels.lock().unwrap();
+        let mut channels = safe_lock(&ctx.data().suggestions_channels);
         let initial_len = channels.len();
         channels.retain(|c| c != &channel_id);
         let removed = initial_len != channels.len();
@@ -1071,7 +1089,7 @@ async fn setup_autorole(ctx: Context<'_>, role: serenity::Role) -> Result<(), Er
     };
     
     {
-        let mut roles = ctx.data().auto_roles.lock().unwrap();
+        let mut roles = safe_lock(&ctx.data().auto_roles);
         // Видаляємо стару роль для цього серверу
         roles.retain(|r| r.guild_id != guild_id.to_string());
         // Додаємо нову
@@ -1089,7 +1107,7 @@ async fn remove_autorole(ctx: Context<'_>) -> Result<(), Error> {
     let guild_id = ctx.guild_id().ok_or("Not in a guild")?;
     
     {
-        let mut roles = ctx.data().auto_roles.lock().unwrap();
+        let mut roles = safe_lock(&ctx.data().auto_roles);
         roles.retain(|r| r.guild_id != guild_id.to_string());
         save_json(AUTO_ROLES_FILE, &*roles);
     }
@@ -1104,7 +1122,7 @@ async fn remove_autorole(ctx: Context<'_>) -> Result<(), Error> {
 #[poise::command(slash_command, default_member_permissions = "ADMINISTRATOR")]
 async fn add_banned_word(ctx: Context<'_>, word: String) -> Result<(), Error> {
     {
-        let mut words = ctx.data().banned_words.lock().unwrap();
+        let mut words = safe_lock(&ctx.data().banned_words);
         let word_lower = word.to_lowercase();
         if !words.contains(&word_lower) {
             words.push(word_lower);
@@ -1123,7 +1141,7 @@ async fn add_banned_word(ctx: Context<'_>, word: String) -> Result<(), Error> {
 #[poise::command(slash_command, default_member_permissions = "ADMINISTRATOR")]
 async fn list_banned_words(ctx: Context<'_>) -> Result<(), Error> {
     let words = {
-        let w = ctx.data().banned_words.lock().unwrap();
+        let w = safe_lock(&ctx.data().banned_words);
         w.clone()
     };
     
@@ -1147,7 +1165,7 @@ async fn list_banned_words(ctx: Context<'_>) -> Result<(), Error> {
 #[poise::command(slash_command, default_member_permissions = "ADMINISTRATOR")]
 async fn remove_banned_word(ctx: Context<'_>, word: String) -> Result<(), Error> {
     let removed = {
-        let mut words = ctx.data().banned_words.lock().unwrap();
+        let mut words = safe_lock(&ctx.data().banned_words);
         let word_lower = word.to_lowercase();
         let len_before = words.len();
         words.retain(|w| w != &word_lower);
@@ -1183,9 +1201,9 @@ async fn cleanup_inactive(ctx: Context<'_>, days: u64) -> Result<(), Error> {
     let threshold = Utc::now().timestamp() - (days as i64 * 86400);
     
     let inactive_users: Vec<String> = {
-        let users = ctx.data().users.lock().unwrap();
+        let users = safe_lock(&ctx.data().users);
         users.iter()
-            .filter(|(_, p)| p.last_msg_time < threshold * 1000)
+            .filter(|(_, p)| p.last_msg_time != 0 && p.last_msg_time < threshold * 1000)
             .map(|(id, _)| id.clone())
             .collect()
     };
@@ -1240,7 +1258,7 @@ async fn event_handler(ctx: &serenity::Context, event: &serenity::FullEvent, _fr
         
         // Авто-роль
         let role_to_assign = {
-            let auto_roles = data.auto_roles.lock().unwrap();
+            let auto_roles = safe_lock(&data.auto_roles);
             auto_roles.iter()
                 .find(|r| r.guild_id == guild_id.to_string())
                 .and_then(|r| r.role_id.parse::<u64>().ok())
@@ -1260,7 +1278,7 @@ async fn event_handler(ctx: &serenity::Context, event: &serenity::FullEvent, _fr
         // Перевірка на заборонені слова
         let msg_lower = new_message.content.to_lowercase();
         let contains_banned = {
-            let banned_words = data.banned_words.lock().unwrap();
+            let banned_words = safe_lock(&data.banned_words);
             let mut found = false;
             
             for word in banned_words.iter() {
@@ -1308,7 +1326,7 @@ async fn event_handler(ctx: &serenity::Context, event: &serenity::FullEvent, _fr
         // Обробка повідомлень у каналах ідей
         let channel_id = new_message.channel_id.to_string();
         let is_suggestions_channel = {
-            let channels = data.suggestions_channels.lock().unwrap();
+            let channels = safe_lock(&data.suggestions_channels);
             channels.contains(&channel_id)
         };
         
@@ -1321,7 +1339,7 @@ async fn event_handler(ctx: &serenity::Context, event: &serenity::FullEvent, _fr
                     let author_id = new_message.author.id.to_string();
                     
                     let can_edit = {
-                        let suggestions = data.suggestions_data.lock().unwrap();
+                        let suggestions = safe_lock(&data.suggestions_data);
                         if let Some(suggestion) = suggestions.get(&msg_id) {
                             suggestion.author_id == author_id
                         } else {
@@ -1337,7 +1355,7 @@ async fn event_handler(ctx: &serenity::Context, event: &serenity::FullEvent, _fr
                         
                         // Оновлюємо ідею
                         let updated = {
-                            let mut suggestions = data.suggestions_data.lock().unwrap();
+                            let mut suggestions = safe_lock(&data.suggestions_data);
                             if let Some(suggestion) = suggestions.get_mut(&msg_id) {
                                 suggestion.content = new_content.clone();
                                 let cloned = suggestion.clone();
@@ -1433,8 +1451,9 @@ async fn event_handler(ctx: &serenity::Context, event: &serenity::FullEvent, _fr
                 if let Ok(sent_msg) = msg {
                     //АВТОМАТИЧНЕ СТВОРЕННЯ ТРЕДУ ДЛЯ ОБГОВОРЕННЯ
 
-                    let thread_name = if content.len() > 50 {
-                        format!("Обговорення: {}...", &content[..50])
+                    let truncated: String = content.chars().take(50).collect();
+                    let thread_name = if content.chars().count() > 50 {
+                        format!("Обговорення: {}...", truncated)
                     } else {
                         format!("Обговорення: {}", content)
                     };
@@ -1474,7 +1493,7 @@ async fn event_handler(ctx: &serenity::Context, event: &serenity::FullEvent, _fr
                         timestamp,
                     };
                     
-                    let mut suggestions = data.suggestions_data.lock().unwrap();
+                    let mut suggestions = safe_lock(&data.suggestions_data);
                     suggestions.insert(sent_msg.id.to_string(), suggestion);
                     save_json(SUGGESTIONS_DATA_FILE, &*suggestions);
                 }
@@ -1489,7 +1508,7 @@ async fn event_handler(ctx: &serenity::Context, event: &serenity::FullEvent, _fr
         let mut punish_spam = false;
 
         {
-            let mut users = data.users.lock().unwrap();
+            let mut users = safe_lock(&data.users);
             let p = users.entry(new_message.author.id.to_string()).or_insert(create_default_profile());
 
             if now_millis < p.spam_block_until {
@@ -1574,7 +1593,7 @@ async fn event_handler(ctx: &serenity::Context, event: &serenity::FullEvent, _fr
                 
                 // Оновлюємо ідею
                 let updated = {
-                    let mut suggestions = data.suggestions_data.lock().unwrap();
+                    let mut suggestions = safe_lock(&data.suggestions_data);
                     if let Some(suggestion) = suggestions.get_mut(msg_id) {
                         suggestion.content = new_content.clone();
                         let cloned = suggestion.clone();
@@ -1610,8 +1629,16 @@ async fn event_handler(ctx: &serenity::Context, event: &serenity::FullEvent, _fr
                         .field("Статус", status_text, false)
                         .footer(CreateEmbedFooter::new("Хочете додати свою ідею? Просто напишіть її прямо сюди"));
                     
-                    let channel_id = serenity::ChannelId::new(suggestion.channel_id.parse().unwrap_or(0));
-                    let message_id = serenity::MessageId::new(msg_id.parse().unwrap_or(0));
+                    let channel_num: u64 = match suggestion.channel_id.parse() {
+                        Ok(v) if v > 0 => v,
+                        _ => { warn!("Invalid channel_id in suggestion"); return Ok(()); }
+                    };
+                    let msg_num: u64 = match msg_id.parse() {
+                        Ok(v) if v > 0 => v,
+                        _ => { warn!("Invalid message_id in suggestion"); return Ok(()); }
+                    };
+                    let channel_id = serenity::ChannelId::new(channel_num);
+                    let message_id = serenity::MessageId::new(msg_num);
                     
                     let _ = channel_id.edit_message(&ctx.http, message_id, serenity::EditMessage::new().embed(updated_embed)).await;
                     
@@ -1641,7 +1668,7 @@ async fn event_handler(ctx: &serenity::Context, event: &serenity::FullEvent, _fr
                 let msg_id = interaction.message.id.to_string();
                 
                 let suggestion_data = {
-                    let suggestions = data.suggestions_data.lock().unwrap();
+                    let suggestions = safe_lock(&data.suggestions_data);
                     suggestions.get(&msg_id).cloned()
                 };
                 
@@ -1715,7 +1742,7 @@ async fn event_handler(ctx: &serenity::Context, event: &serenity::FullEvent, _fr
                         suggestion.votes_for += 1;
                         suggestion.voted_users.push(vote_key);
                         {
-                            let mut suggestions = data.suggestions_data.lock().unwrap();
+                            let mut suggestions = safe_lock(&data.suggestions_data);
                             suggestions.insert(msg_id.clone(), suggestion.clone());
                             save_json(SUGGESTIONS_DATA_FILE, &*suggestions);
                         }
@@ -1775,7 +1802,7 @@ async fn event_handler(ctx: &serenity::Context, event: &serenity::FullEvent, _fr
                         suggestion.votes_against += 1;
                         suggestion.voted_users.push(vote_key);
                         {
-                            let mut suggestions = data.suggestions_data.lock().unwrap();
+                            let mut suggestions = safe_lock(&data.suggestions_data);
                             suggestions.insert(msg_id.clone(), suggestion.clone());
                             save_json(SUGGESTIONS_DATA_FILE, &*suggestions);
                         }
@@ -1817,7 +1844,7 @@ async fn event_handler(ctx: &serenity::Context, event: &serenity::FullEvent, _fr
                         
                         // Видаляємо ідею з JSON після прийняття
                         {
-                            let mut suggestions = data.suggestions_data.lock().unwrap();
+                            let mut suggestions = safe_lock(&data.suggestions_data);
                             suggestions.remove(&msg_id);
                             save_json(SUGGESTIONS_DATA_FILE, &*suggestions);
                         }
@@ -1844,7 +1871,7 @@ async fn event_handler(ctx: &serenity::Context, event: &serenity::FullEvent, _fr
                         
                         // Видаляємо ідею з JSON після відхилення
                         {
-                            let mut suggestions = data.suggestions_data.lock().unwrap();
+                            let mut suggestions = safe_lock(&data.suggestions_data);
                             suggestions.remove(&msg_id);
                             save_json(SUGGESTIONS_DATA_FILE, &*suggestions);
                         }
@@ -1896,7 +1923,7 @@ async fn background_tasks(ctx: serenity::Context, data: Arc<Data>) {
                     for user_id in voice_users {
                         if let Ok(user) = user_id.to_user(&ctx.http).await {
                             if !user.bot {
-                                let mut users = data.users.lock().unwrap();
+                                let mut users = safe_lock(&data.users);
                                 let p = users.entry(user_id.to_string()).or_insert(create_default_profile());
                                 let multiplier = get_xp_multiplier(p);
                                 p.xp += VOICE_XP_AMOUNT * multiplier;
@@ -1912,7 +1939,7 @@ async fn background_tasks(ctx: serenity::Context, data: Arc<Data>) {
                 }
 
                 if save {
-                    let u = data.users.lock().unwrap();
+                    let u = safe_lock(&data.users);
                     save_json(USERS_FILE, &*u);
                 }
 
@@ -1932,7 +1959,7 @@ async fn background_tasks(ctx: serenity::Context, data: Arc<Data>) {
                 if now.hour() == 9 {
                     let today = format!("{:02}.{:02}", now.day(), now.month());
                     let celebs = {
-                        let bds = data.birthdays.lock().unwrap();
+                        let bds = safe_lock(&data.birthdays);
                         bds.iter().filter(|(_, d)| *d == &today).map(|(u,_)| format!("<@{}>", u)).collect::<Vec<_>>()
                     };
 
@@ -2045,12 +2072,12 @@ async fn main() {
                 });
                 tokio::spawn(async move { background_tasks(ctx_clone, data_clone).await; });
                 info!("✅ StarostaBot успішно запущено!");
-                info!("📊 Завантажено користувачів: {}", data.users.lock().unwrap().len());
-                info!("🎂 Завантажено днів народження: {}", data.birthdays.lock().unwrap().len());
-                info!("🎭 Завантажено авто-ролей: {}", data.auto_roles.lock().unwrap().len());
-                info!("🚫 Завантажено заборонених слів: {}", data.banned_words.lock().unwrap().len());
-                info!("💡 Завантажено каналів ідей: {}", data.suggestions_channels.lock().unwrap().len());
-                info!("📝 Завантажено ідей: {}", data.suggestions_data.lock().unwrap().len());
+                info!("📊 Завантажено користувачів: {}", safe_lock(&data.users).len());
+                info!("🎂 Завантажено днів народження: {}", safe_lock(&data.birthdays).len());
+                info!("🎭 Завантажено авто-ролей: {}", safe_lock(&data.auto_roles).len());
+                info!("🚫 Завантажено заборонених слів: {}", safe_lock(&data.banned_words).len());
+                info!("💡 Завантажено каналів ідей: {}", safe_lock(&data.suggestions_channels).len());
+                info!("📝 Завантажено ідей: {}", safe_lock(&data.suggestions_data).len());
                 Ok(data)
             })
         })
