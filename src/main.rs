@@ -9,22 +9,113 @@ use serenity::{
 };
 use std::collections::HashMap;
 use std::fs;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::time;
 use tracing::{error, info, warn};
 
 // --- НАЛАШТУВАННЯ ---
-// Токен та Admin ID з змінних оточення
-fn get_token() -> String {
-    std::env::var("DISCORD_TOKEN").expect("DISCORD_TOKEN must be set in environment variables")
+
+/// Loads a `.env` file (KEY=VALUE per line) into the process environment.
+/// Needed because Discloud doesn't let us set variables in the panel — the bot
+/// must read its token/admin id straight from the bundled `.env`. Existing real
+/// environment variables always win, so this never overrides the host.
+fn load_env_file() {
+    // Look in the current dir and next to the executable, so it works whether
+    // the bot is started from the project root or from ./target/release.
+    let mut candidates = vec![std::path::PathBuf::from(".env")];
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join(".env"));
+        }
+    }
+
+    for path in candidates {
+        let contents = match fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        for (key, value) in parse_env(&contents) {
+            // Don't clobber variables already provided by the real environment.
+            if std::env::var(&key).is_err() {
+                std::env::set_var(&key, &value);
+            }
+        }
+        info!("✅ Завантажено змінні оточення з {}", path.display());
+        return;
+    }
+
+    warn!("⚠️ Файл .env не знайдено; покладаюся на змінні оточення системи.");
 }
 
+/// Parses `.env` file contents into (key, value) pairs. Handles comments, blank
+/// lines, an optional `export` prefix, surrounding quotes, a UTF-8 BOM, and
+/// CRLF line endings.
+fn parse_env(contents: &str) -> Vec<(String, String)> {
+    // Strip a leading UTF-8 BOM, otherwise the first key would be parsed as
+    // "\u{feff}DISCORD_TOKEN".
+    let contents = contents.strip_prefix('\u{feff}').unwrap_or(contents);
+    let mut pairs = Vec::new();
+
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line);
+
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        if key.is_empty() {
+            continue;
+        }
+        let value = value.trim();
+        let value = value
+            .strip_prefix('"')
+            .and_then(|v| v.strip_suffix('"'))
+            .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
+            .unwrap_or(value);
+
+        pairs.push((key.to_string(), value.to_string()));
+    }
+    pairs
+}
+
+// Токен та Admin ID з змінних оточення
+
+/// Returns the bot token from the environment, or `None` if it is not set.
+/// Never panics — the caller decides how to handle a missing token.
+fn get_token() -> Option<String> {
+    match std::env::var("DISCORD_TOKEN") {
+        Ok(t) if !t.trim().is_empty() => Some(t),
+        _ => None,
+    }
+}
+
+/// Cached admin id, resolved once. `0` means "no valid admin configured"
+/// (no real Discord user has id 0, so admin checks simply fail gracefully).
+static ADMIN_ID: OnceLock<u64> = OnceLock::new();
+
+/// Returns the configured admin id, or `0` if unset/invalid.
+/// Never panics, so it is safe to call from hot paths (message handler, tasks).
 fn get_admin_id() -> u64 {
-    std::env::var("ADMIN_ID")
-        .expect("ADMIN_ID must be set in environment variables")
-        .parse::<u64>()
-        .expect("ADMIN_ID must be a valid number")
+    *ADMIN_ID.get_or_init(|| match std::env::var("ADMIN_ID") {
+        Ok(s) => match s.trim().parse::<u64>() {
+            Ok(id) => id,
+            Err(_) => {
+                warn!("⚠️ ADMIN_ID is not a valid number; admin-only features disabled.");
+                0
+            }
+        },
+        Err(_) => {
+            warn!("⚠️ ADMIN_ID is not set; admin-only features disabled.");
+            0
+        }
+    })
 }
 
 const USERS_FILE: &str = "users.json";
@@ -58,9 +149,12 @@ struct UserProfile {
     #[serde(default)]
     xp_booster_x5_until: i64,
 
-    // Поля для анті-спаму (не зберігаються в JSON)
-    #[serde(skip)]
+    // Час останнього повідомлення (мс). Зберігається, щоб /cleanup_inactive
+    // працював і після перезапуску бота.
+    #[serde(default)]
     last_msg_time: i64,
+
+    // Поля для анті-спаму (не зберігаються в JSON)
     #[serde(skip)]
     spam_counter: u8,
     #[serde(skip)]
@@ -95,12 +189,23 @@ struct Data {
     birthdays: Arc<Mutex<HashMap<String, String>>>,
     auto_roles: Arc<Mutex<Vec<AutoRole>>>,
     banned_words: Arc<Mutex<Vec<String>>>,
+    // Кеш скомпільованих регулярних виразів для заборонених слів, щоб не
+    // компілювати їх заново на кожне повідомлення.
+    banned_regex_cache: Arc<Mutex<HashMap<String, Regex>>>,
     suggestions_channels: Arc<Mutex<Vec<String>>>, // ID каналів для ідей
     suggestions_data: Arc<Mutex<HashMap<String, SuggestionData>>>, // message_id -> SuggestionData
 }
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 type Context<'a> = poise::Context<'a, Data, Error>;
+
+/// Result of atomically recording a vote on a suggestion.
+enum VoteOutcome {
+    AlreadyVotedSame,
+    AlreadyVotedOther,
+    Gone,
+    Recorded(SuggestionData),
+}
 
 // --- КОНФІГУРАЦІЯ РОЛЕЙ ---
 fn get_roles_config() -> Vec<(u64, &'static str, u32)> {
@@ -155,18 +260,28 @@ fn load_json<T: for<'a> Deserialize<'a> + Default>(path: &str) -> T {
 }
 
 fn save_json<T: Serialize>(path: &str, data: &T) {
-    match serde_json::to_string_pretty(data) {
-        Ok(json) => {
-            if let Err(e) = fs::write(path, json) {
-                error!("❌ Не вдалося зберегти {}: {}", path, e);
-            } else {
-                info!("💾 Збережено: {}", path);
-            }
-        }
+    let json = match serde_json::to_string_pretty(data) {
+        Ok(json) => json,
         Err(e) => {
             error!("❌ Помилка серіалізації {}: {}", path, e);
+            return;
         }
+    };
+
+    // Write atomically: serialize to a temp file in the same directory, then
+    // rename over the target. A crash mid-write can never truncate/corrupt the
+    // real file (which would otherwise wipe all data on the next load).
+    let tmp_path = format!("{}.tmp", path);
+    if let Err(e) = fs::write(&tmp_path, &json) {
+        error!("❌ Не вдалося записати тимчасовий файл {}: {}", tmp_path, e);
+        return;
     }
+    if let Err(e) = fs::rename(&tmp_path, path) {
+        error!("❌ Не вдалося зберегти {}: {}", path, e);
+        let _ = fs::remove_file(&tmp_path);
+        return;
+    }
+    info!("💾 Збережено: {}", path);
 }
 
 fn get_xp_needed(level: u64) -> u64 {
@@ -708,23 +823,62 @@ async fn admin_announce(ctx: Context<'_>, channel: ChannelId, text: String) -> R
     Ok(())
 }
 
+/// Deletes messages while respecting Discord's rules: bulk delete only accepts
+/// 2–100 messages newer than 14 days. Older messages — and lone messages — are
+/// removed one by one so the command never errors out on those edge cases.
+async fn delete_messages_safely(
+    http: &serenity::Http,
+    channel_id: serenity::ChannelId,
+    messages: &[serenity::Message],
+) -> usize {
+    let cutoff = Utc::now().timestamp() - 14 * 24 * 60 * 60;
+    let mut recent: Vec<serenity::MessageId> = Vec::new();
+    let mut old: Vec<serenity::MessageId> = Vec::new();
+    for m in messages {
+        if m.timestamp.unix_timestamp() >= cutoff {
+            recent.push(m.id);
+        } else {
+            old.push(m.id);
+        }
+    }
+
+    let mut deleted = 0;
+    for chunk in recent.chunks(100) {
+        match chunk {
+            [] => {}
+            // Bulk delete requires at least 2 messages; delete a lone one directly.
+            [single] => {
+                if channel_id.delete_message(http, *single).await.is_ok() {
+                    deleted += 1;
+                }
+            }
+            many => {
+                if channel_id.delete_messages(http, many).await.is_ok() {
+                    deleted += many.len();
+                }
+            }
+        }
+    }
+    for id in old {
+        if channel_id.delete_message(http, id).await.is_ok() {
+            deleted += 1;
+        }
+    }
+    deleted
+}
+
 /// [ADMIN] Видалити повідомлення
 #[poise::command(slash_command, default_member_permissions = "MANAGE_MESSAGES")]
 async fn purge(ctx: Context<'_>, amount: u64) -> Result<(), Error> {
     ctx.defer_ephemeral().await?;
-    let count = if amount > 100 { 100 } else { amount };
+    let count = amount.clamp(1, 100);
     let messages = ctx
         .channel_id()
         .messages(&ctx.http(), GetMessages::new().limit(count as u8))
         .await?;
-    let msg_ids: Vec<_> = messages.iter().map(|m| m.id).collect();
 
-    if !msg_ids.is_empty() {
-        ctx.channel_id()
-            .delete_messages(&ctx.http(), &msg_ids)
-            .await?;
-    }
-    ctx.say(format!("🧹 Адмін видалив {} повідомлень.", msg_ids.len()))
+    let deleted = delete_messages_safely(ctx.http(), ctx.channel_id(), &messages).await;
+    ctx.say(format!("🧹 Адмін видалив {} повідомлень.", deleted))
         .await?;
     Ok(())
 }
@@ -738,18 +892,13 @@ async fn clean(ctx: Context<'_>) -> Result<(), Error> {
         .messages(&ctx.http(), GetMessages::new().limit(100))
         .await?;
     let bot_id = ctx.framework().bot_id;
-    let to_delete: Vec<_> = messages
-        .iter()
+    let to_delete: Vec<serenity::Message> = messages
+        .into_iter()
         .filter(|m| m.author.id == bot_id)
-        .map(|m| m.id)
         .collect();
 
-    if !to_delete.is_empty() {
-        ctx.channel_id()
-            .delete_messages(&ctx.http(), &to_delete)
-            .await?;
-    }
-    ctx.say(format!("🧹 Видалено {} моїх повідомлень.", to_delete.len()))
+    let deleted = delete_messages_safely(ctx.http(), ctx.channel_id(), &to_delete).await;
+    ctx.say(format!("🧹 Видалено {} моїх повідомлень.", deleted))
         .await?;
     Ok(())
 }
@@ -850,7 +999,7 @@ async fn daily(ctx: Context<'_>) -> Result<(), Error> {
             Err(wait)
         } else {
             let bonus = rand::thread_rng().gen_range(50..150);
-            profile.chips += bonus;
+            profile.chips = profile.chips.saturating_add(bonus);
             profile.last_daily = now;
             save_json(USERS_FILE, &*users);
             Ok(bonus)
@@ -893,7 +1042,7 @@ async fn casino(ctx: Context<'_>, amount: u64) -> Result<(), Error> {
         if profile.chips < amount || amount == 0 {
             None
         } else if rand::thread_rng().gen_bool(0.45) {
-            profile.chips += amount;
+            profile.chips = profile.chips.saturating_add(amount);
             Some((format!("🎰 Виграв **{} гривень**! 🤑", amount), true))
         } else {
             profile.chips = profile.chips.saturating_sub(amount);
@@ -951,8 +1100,8 @@ async fn blackjack(ctx: Context<'_>, bet: u64) -> Result<(), Error> {
     use rand::seq::SliceRandom;
     deck.shuffle(&mut rand::thread_rng());
     let (mut player, mut dealer) = (
-        vec![deck.pop().unwrap(), deck.pop().unwrap()],
-        vec![deck.pop().unwrap(), deck.pop().unwrap()],
+        vec![deck.pop().unwrap_or(10), deck.pop().unwrap_or(10)],
+        vec![deck.pop().unwrap_or(10), deck.pop().unwrap_or(10)],
     );
     fn calc(h: &[u8]) -> u8 {
         let mut s: u16 = h.iter().map(|&x| x as u16).sum();
@@ -1066,7 +1215,7 @@ async fn blackjack(ctx: Context<'_>, bet: u64) -> Result<(), Error> {
         let mut users = safe_lock(&ctx.data().users);
         let p = users.entry(uid_str).or_insert(create_default_profile());
         if res == 1 {
-            p.chips += bet;
+            p.chips = p.chips.saturating_add(bet);
         } else {
             p.chips = p.chips.saturating_sub(bet);
         }
@@ -1539,21 +1688,31 @@ async fn cleanup_inactive(ctx: Context<'_>, days: u64) -> Result<(), Error> {
             .collect()
     };
 
+    // Fetch the guild's roles once up front instead of re-fetching them inside
+    // the per-user / per-role loop (which hammered the API and risked rate
+    // limits on large servers).
+    let all_roles = guild_id.roles(&ctx.http()).await?;
+    let config = get_roles_config();
+    let level_role_ids: Vec<serenity::RoleId> = config
+        .iter()
+        .filter_map(|(_, role_name, _)| {
+            all_roles
+                .values()
+                .find(|r| r.name == *role_name)
+                .map(|r| r.id)
+        })
+        .collect();
+
     let mut removed_count = 0;
 
     for user_id_str in inactive_users {
         if let Ok(user_id_num) = user_id_str.parse::<u64>() {
             let user_id = serenity::UserId::new(user_id_num);
             if let Ok(member) = guild_id.member(&ctx.http(), user_id).await {
-                let config = get_roles_config();
-                for (_, role_name, _) in config {
-                    if let Ok(roles) = guild_id.roles(&ctx.http()).await {
-                        if let Some(role) = roles.values().find(|r| r.name == role_name) {
-                            if member.roles.contains(&role.id) {
-                                let _ = member.remove_role(&ctx.http(), role.id).await;
-                                removed_count += 1;
-                            }
-                        }
+                for role_id in &level_role_ids {
+                    if member.roles.contains(role_id) {
+                        let _ = member.remove_role(&ctx.http(), *role_id).await;
+                        removed_count += 1;
                     }
                 }
             }
@@ -1566,6 +1725,40 @@ async fn cleanup_inactive(ctx: Context<'_>, days: u64) -> Result<(), Error> {
     ))
     .await?;
     Ok(())
+}
+
+// --- ОБРОБКА ПОМИЛОК ---
+/// Catches every error bubbling out of a command or the event handler so a
+/// single failing interaction can never take the whole bot down.
+async fn on_error(error: poise::FrameworkError<'_, Data, Error>) {
+    match error {
+        poise::FrameworkError::Setup { error, .. } => {
+            error!("❌ Помилка ініціалізації: {:?}", error);
+        }
+        poise::FrameworkError::Command { error, ctx, .. } => {
+            error!("❌ Помилка в команді '{}': {:?}", ctx.command().name, error);
+            // Best-effort notice to the user; ignore failures here.
+            let _ = ctx
+                .send(
+                    poise::CreateReply::default()
+                        .content("⚠️ Сталася помилка під час виконання команди.")
+                        .ephemeral(true),
+                )
+                .await;
+        }
+        poise::FrameworkError::EventHandler { error, event, .. } => {
+            error!(
+                "❌ Помилка в обробнику події '{}': {:?}",
+                event.snake_case_name(),
+                error
+            );
+        }
+        other => {
+            if let Err(e) = poise::builtins::on_error(other).await {
+                error!("❌ Помилка в обробнику помилок: {:?}", e);
+            }
+        }
+    }
 }
 
 // --- ФОНОВІ ЗАВДАННЯ ---
@@ -1630,11 +1823,26 @@ async fn event_handler(
         let msg_lower = new_message.content.to_lowercase();
         let contains_banned = {
             let banned_words = safe_lock(&data.banned_words);
+            let mut cache = safe_lock(&data.banned_regex_cache);
             let mut found = false;
 
             for word in banned_words.iter() {
-                let pattern = format!(r"\b{}\b", regex::escape(word));
-                if let Ok(re) = Regex::new(&pattern) {
+                // Compile each word's pattern at most once, then reuse it.
+                let re = match cache.get(word) {
+                    Some(re) => Some(re),
+                    None => {
+                        let pattern = format!(r"\b{}\b", regex::escape(word));
+                        match Regex::new(&pattern) {
+                            Ok(re) => {
+                                cache.insert(word.clone(), re);
+                                cache.get(word)
+                            }
+                            Err(_) => None,
+                        }
+                    }
+                };
+
+                if let Some(re) = re {
                     if re.is_match(&msg_lower) {
                         found = true;
                         break;
@@ -1937,10 +2145,15 @@ async fn event_handler(
                 punish_spam = true;
             } else {
                 let multiplier = get_xp_multiplier(p);
-                p.xp += MSG_XP_AMOUNT * multiplier;
+                p.xp =
+                    p.xp.saturating_add(MSG_XP_AMOUNT.saturating_mul(multiplier));
             }
 
             lvl = try_levelup(p);
+
+            // Persist the updated XP / last_msg_time so progress survives a
+            // restart and /cleanup_inactive has accurate activity timestamps.
+            save_json(USERS_FILE, &*users);
         }
 
         if punish_spam {
@@ -2190,46 +2403,50 @@ async fn event_handler(
                             return Ok(());
                         }
 
-                        // Перевірка: чи користувач вже голосував?
+                        // Атомарно перевіряємо дубль і записуємо голос під одним
+                        // локом, щоб одночасні натискання не загубили голос.
                         let vote_key = format!("{}:like", user_id);
-                        let already_voted_like = suggestion.voted_users.contains(&vote_key);
                         let vote_key_dislike = format!("{}:dislike", user_id);
-                        let already_voted_dislike =
-                            suggestion.voted_users.contains(&vote_key_dislike);
-
-                        if already_voted_like {
-                            interaction
-                                .create_response(
-                                    &ctx.http,
-                                    serenity::CreateInteractionResponse::Message(
-                                        serenity::CreateInteractionResponseMessage::new()
-                                            .content(
-                                                "❌ Ви вже проголосували \"Класнючка\" за цю ідею!",
-                                            )
-                                            .ephemeral(true),
-                                    ),
-                                )
-                                .await?;
-                            return Ok(());
-                        }
-
-                        if already_voted_dislike {
-                            interaction.create_response(&ctx.http, serenity::CreateInteractionResponse::Message(
-                                serenity::CreateInteractionResponseMessage::new()
-                                    .content("❌ Ви вже проголосували \"Жах\" за цю ідею! Неможливо змінити голос.")
-                                    .ephemeral(true)
-                            )).await?;
-                            return Ok(());
-                        }
-
-                        // Додаємо голос
-                        suggestion.votes_for += 1;
-                        suggestion.voted_users.push(vote_key);
-                        {
+                        let outcome = {
                             let mut suggestions = safe_lock(&data.suggestions_data);
-                            suggestions.insert(msg_id.clone(), suggestion.clone());
-                            save_json(SUGGESTIONS_DATA_FILE, &*suggestions);
-                        }
+                            match suggestions.get_mut(&msg_id) {
+                                None => VoteOutcome::Gone,
+                                Some(s) => {
+                                    if s.voted_users.contains(&vote_key) {
+                                        VoteOutcome::AlreadyVotedSame
+                                    } else if s.voted_users.contains(&vote_key_dislike) {
+                                        VoteOutcome::AlreadyVotedOther
+                                    } else {
+                                        s.votes_for += 1;
+                                        s.voted_users.push(vote_key);
+                                        let snap = s.clone();
+                                        save_json(SUGGESTIONS_DATA_FILE, &*suggestions);
+                                        VoteOutcome::Recorded(snap)
+                                    }
+                                }
+                            }
+                        };
+
+                        let suggestion = match outcome {
+                            VoteOutcome::AlreadyVotedSame => {
+                                interaction.create_response(&ctx.http, serenity::CreateInteractionResponse::Message(
+                                    serenity::CreateInteractionResponseMessage::new()
+                                        .content("❌ Ви вже проголосували \"Класнючка\" за цю ідею!")
+                                        .ephemeral(true)
+                                )).await?;
+                                return Ok(());
+                            }
+                            VoteOutcome::AlreadyVotedOther => {
+                                interaction.create_response(&ctx.http, serenity::CreateInteractionResponse::Message(
+                                    serenity::CreateInteractionResponseMessage::new()
+                                        .content("❌ Ви вже проголосували \"Жах\" за цю ідею! Неможливо змінити голос.")
+                                        .ephemeral(true)
+                                )).await?;
+                                return Ok(());
+                            }
+                            VoteOutcome::Gone => return Ok(()),
+                            VoteOutcome::Recorded(s) => s,
+                        };
 
                         // Оновлюємо embed
                         let total = suggestion.votes_for + suggestion.votes_against;
@@ -2280,43 +2497,57 @@ async fn event_handler(
                             return Ok(());
                         }
 
-                        // Перевірка: чи користувач вже голосував?
+                        // Атомарно перевіряємо дубль і записуємо голос під одним
+                        // локом, щоб одночасні натискання не загубили голос.
                         let vote_key = format!("{}:dislike", user_id);
-                        let already_voted_dislike = suggestion.voted_users.contains(&vote_key);
                         let vote_key_like = format!("{}:like", user_id);
-                        let already_voted_like = suggestion.voted_users.contains(&vote_key_like);
-
-                        if already_voted_dislike {
-                            interaction
-                                .create_response(
-                                    &ctx.http,
-                                    serenity::CreateInteractionResponse::Message(
-                                        serenity::CreateInteractionResponseMessage::new()
-                                            .content("❌ Ви вже проголосували \"Жах\" за цю ідею!")
-                                            .ephemeral(true),
-                                    ),
-                                )
-                                .await?;
-                            return Ok(());
-                        }
-
-                        if already_voted_like {
-                            interaction.create_response(&ctx.http, serenity::CreateInteractionResponse::Message(
-                                serenity::CreateInteractionResponseMessage::new()
-                                    .content("❌ Ви вже проголосували \"Класнючка\" за цю ідею! Неможливо змінити голос.")
-                                    .ephemeral(true)
-                            )).await?;
-                            return Ok(());
-                        }
-
-                        // Додаємо голос
-                        suggestion.votes_against += 1;
-                        suggestion.voted_users.push(vote_key);
-                        {
+                        let outcome = {
                             let mut suggestions = safe_lock(&data.suggestions_data);
-                            suggestions.insert(msg_id.clone(), suggestion.clone());
-                            save_json(SUGGESTIONS_DATA_FILE, &*suggestions);
-                        }
+                            match suggestions.get_mut(&msg_id) {
+                                None => VoteOutcome::Gone,
+                                Some(s) => {
+                                    if s.voted_users.contains(&vote_key) {
+                                        VoteOutcome::AlreadyVotedSame
+                                    } else if s.voted_users.contains(&vote_key_like) {
+                                        VoteOutcome::AlreadyVotedOther
+                                    } else {
+                                        s.votes_against += 1;
+                                        s.voted_users.push(vote_key);
+                                        let snap = s.clone();
+                                        save_json(SUGGESTIONS_DATA_FILE, &*suggestions);
+                                        VoteOutcome::Recorded(snap)
+                                    }
+                                }
+                            }
+                        };
+
+                        let suggestion = match outcome {
+                            VoteOutcome::AlreadyVotedSame => {
+                                interaction
+                                    .create_response(
+                                        &ctx.http,
+                                        serenity::CreateInteractionResponse::Message(
+                                            serenity::CreateInteractionResponseMessage::new()
+                                                .content(
+                                                    "❌ Ви вже проголосували \"Жах\" за цю ідею!",
+                                                )
+                                                .ephemeral(true),
+                                        ),
+                                    )
+                                    .await?;
+                                return Ok(());
+                            }
+                            VoteOutcome::AlreadyVotedOther => {
+                                interaction.create_response(&ctx.http, serenity::CreateInteractionResponse::Message(
+                                    serenity::CreateInteractionResponseMessage::new()
+                                        .content("❌ Ви вже проголосували \"Класнючка\" за цю ідею! Неможливо змінити голос.")
+                                        .ephemeral(true)
+                                )).await?;
+                                return Ok(());
+                            }
+                            VoteOutcome::Gone => return Ok(()),
+                            VoteOutcome::Recorded(s) => s,
+                        };
 
                         let total = suggestion.votes_for + suggestion.votes_against;
                         let percent = if total > 0 {
@@ -2479,9 +2710,17 @@ async fn background_tasks(ctx: serenity::Context, data: Arc<Data>) {
 
                 let guilds = ctx.cache.guilds();
                 for g in guilds {
+                    // Collect active (non-bot) voice users straight from the
+                    // cache — no per-user HTTP call, which previously risked
+                    // rate limits with busy voice channels.
                     let voice_users: Vec<serenity::UserId> = if let Some(guild) = g.to_guild_cached(&ctx.cache) {
                          guild.voice_states.iter()
                             .filter(|(_, s)| !s.self_deaf && !s.self_mute)
+                            .filter(|(uid, _)| {
+                                // Skip bots using cached member info; if the
+                                // member isn't cached, assume a human.
+                                !guild.members.get(uid).map(|m| m.user.bot).unwrap_or(false)
+                            })
                             .map(|(_, s)| s.user_id)
                             .collect()
                     } else {
@@ -2489,20 +2728,16 @@ async fn background_tasks(ctx: serenity::Context, data: Arc<Data>) {
                     };
 
                     for user_id in voice_users {
-                        if let Ok(user) = user_id.to_user(&ctx.http).await {
-                            if !user.bot {
-                                let mut users = safe_lock(&data.users);
-                                let p = users.entry(user_id.to_string()).or_insert(create_default_profile());
-                                let multiplier = get_xp_multiplier(p);
-                                p.xp += VOICE_XP_AMOUNT * multiplier;
-                                p.minutes += 1;
+                        let mut users = safe_lock(&data.users);
+                        let p = users.entry(user_id.to_string()).or_insert(create_default_profile());
+                        let multiplier = get_xp_multiplier(p);
+                        p.xp = p.xp.saturating_add(VOICE_XP_AMOUNT.saturating_mul(multiplier));
+                        p.minutes = p.minutes.saturating_add(1);
 
-                                if let Some(new_lvl) = try_levelup(p) {
-                                    updates.push((user_id, g, new_lvl));
-                                }
-                                save = true;
-                            }
+                        if let Some(new_lvl) = try_levelup(p) {
+                            updates.push((user_id, g, new_lvl));
                         }
+                        save = true;
                     }
                 }
 
@@ -2526,17 +2761,60 @@ async fn background_tasks(ctx: serenity::Context, data: Arc<Data>) {
                 let now = Local::now();
                 if now.hour() == 9 {
                     let today = format!("{:02}.{:02}", now.day(), now.month());
-                    let celebs = {
+                    let (celeb_ids, celebs): (Vec<u64>, Vec<String>) = {
                         let bds = safe_lock(&data.birthdays);
-                        bds.iter().filter(|(_, d)| *d == &today).map(|(u,_)| format!("<@{}>", u)).collect::<Vec<_>>()
+                        let mut ids = Vec::new();
+                        let mut mentions = Vec::new();
+                        for (u, d) in bds.iter() {
+                            if d == &today {
+                                if let Ok(id) = u.parse::<u64>() {
+                                    ids.push(id);
+                                }
+                                mentions.push(format!("<@{}>", u));
+                            }
+                        }
+                        (ids, mentions)
                     };
 
-                    if !celebs.is_empty() {
-                         let guilds: Vec<serenity::GuildId> = ctx.cache.guilds();
-                         for g in guilds {
-                            let system_channel_id = g.to_guild_cached(&ctx.cache)
-                                .and_then(|g| g.system_channel_id);
+                    let guilds: Vec<serenity::GuildId> = ctx.cache.guilds();
+                    for g in guilds {
+                        // Work out role changes from cache first (no awaits while
+                        // holding the cache ref), then apply them over HTTP.
+                        let (role_id, to_add, to_remove, system_channel_id) =
+                            if let Some(guild) = g.to_guild_cached(&ctx.cache) {
+                                let role_id = guild.roles.values()
+                                    .find(|r| r.name == BIRTHDAY_ROLE_NAME)
+                                    .map(|r| r.id);
+                                let mut to_add: Vec<serenity::UserId> = Vec::new();
+                                let mut to_remove: Vec<serenity::UserId> = Vec::new();
+                                if let Some(rid) = role_id {
+                                    for (uid, m) in guild.members.iter() {
+                                        let is_celeb = celeb_ids.contains(&uid.get());
+                                        let has_role = m.roles.contains(&rid);
+                                        if is_celeb && !has_role {
+                                            to_add.push(*uid);
+                                        } else if !is_celeb && has_role {
+                                            to_remove.push(*uid);
+                                        }
+                                    }
+                                }
+                                (role_id, to_add, to_remove, guild.system_channel_id)
+                            } else {
+                                (None, Vec::new(), Vec::new(), None)
+                            };
 
+                        // Grant the birthday role to today's celebrants and take
+                        // it away from anyone whose birthday has passed.
+                        if let Some(rid) = role_id {
+                            for uid in to_add {
+                                let _ = ctx.http.add_member_role(g, uid, rid, Some("День народження")).await;
+                            }
+                            for uid in to_remove {
+                                let _ = ctx.http.remove_member_role(g, uid, rid, Some("День народження минув")).await;
+                            }
+                        }
+
+                        if !celebs.is_empty() {
                             if let Some(chan_id) = system_channel_id {
                                 let _ = chan_id.say(&ctx.http, format!("🎂 **СВЯТО!** Вітаємо: {}", celebs.join(", "))).await;
                             }
@@ -2570,6 +2848,10 @@ async fn main() {
 
     info!("🚀 Запуск StarostaBot...");
 
+    // Load DISCORD_TOKEN / ADMIN_ID from the bundled .env file (Discloud has no
+    // env-var panel), before anything reads them.
+    load_env_file();
+
     let users_data = Arc::new(Mutex::new(load_json(USERS_FILE)));
     let birthdays_data = Arc::new(Mutex::new(load_json(BIRTHDAY_FILE)));
     let auto_roles_data = Arc::new(Mutex::new(load_json(AUTO_ROLES_FILE)));
@@ -2580,12 +2862,15 @@ async fn main() {
     let suggestions_data_data = Arc::new(Mutex::new(load_json::<HashMap<String, SuggestionData>>(
         SUGGESTIONS_DATA_FILE,
     )));
+    let banned_regex_cache_data: Arc<Mutex<HashMap<String, Regex>>> =
+        Arc::new(Mutex::new(HashMap::new()));
 
     let data = Data {
         users: users_data.clone(),
         birthdays: birthdays_data.clone(),
         auto_roles: auto_roles_data.clone(),
         banned_words: banned_words_data.clone(),
+        banned_regex_cache: banned_regex_cache_data.clone(),
         suggestions_channels: suggestions_channels_data.clone(),
         suggestions_data: suggestions_data_data.clone(),
     };
@@ -2630,6 +2915,7 @@ async fn main() {
             event_handler: |ctx, event, framework, data| {
                 Box::pin(event_handler(ctx, event, framework, data))
             },
+            on_error: |error| Box::pin(on_error(error)),
             ..Default::default()
         })
         .setup(|ctx, _ready, framework| {
@@ -2641,12 +2927,40 @@ async fn main() {
                     birthdays: birthdays_data.clone(),
                     auto_roles: auto_roles_data.clone(),
                     banned_words: banned_words_data.clone(),
+                    banned_regex_cache: banned_regex_cache_data.clone(),
                     suggestions_channels: suggestions_channels_data.clone(),
                     suggestions_data: suggestions_data_data.clone(),
                 });
-                tokio::spawn(async move {
-                    background_tasks(ctx_clone, data_clone).await;
-                });
+                // Spawn background tasks only once, even if Discord fires
+                // multiple Ready events (e.g. after a gateway reconnect).
+                static BG_STARTED: AtomicBool = AtomicBool::new(false);
+                if !BG_STARTED.swap(true, Ordering::SeqCst) {
+                    tokio::spawn(async move {
+                        // Supervisor: if the background loop ever panics, log it
+                        // and restart it so voice XP / birthdays / backups keep
+                        // running instead of dying silently.
+                        loop {
+                            let ctx_task = ctx_clone.clone();
+                            let data_task = data_clone.clone();
+                            let handle =
+                                tokio::spawn(
+                                    async move { background_tasks(ctx_task, data_task).await },
+                                );
+                            match handle.await {
+                                Ok(()) => {
+                                    warn!("⚠️ Фонові завдання завершились, перезапуск...");
+                                }
+                                Err(e) => {
+                                    error!(
+                                        "❌ Фонові завдання впали з панікою: {:?}. Перезапуск...",
+                                        e
+                                    );
+                                }
+                            }
+                            time::sleep(Duration::from_secs(5)).await;
+                        }
+                    });
+                }
                 info!("✅ StarostaBot успішно запущено!");
                 info!(
                     "📊 Завантажено користувачів: {}",
@@ -2683,7 +2997,15 @@ async fn main() {
         | serenity::GatewayIntents::GUILDS
         | serenity::GatewayIntents::GUILD_MEMBERS;
 
-    let token = get_token();
+    let token = match get_token() {
+        Some(t) => t,
+        None => {
+            error!("❌ DISCORD_TOKEN не встановлено. Бот не може запуститися.");
+            return;
+        }
+    };
+    // Resolve (and warn about) the admin id once at startup.
+    let _ = get_admin_id();
 
     let client = serenity::ClientBuilder::new(token, intents)
         .framework(framework)
@@ -2691,13 +3013,54 @@ async fn main() {
 
     match client {
         Ok(mut client) => {
-            info!("🔌 Підключення до Discord...");
-            if let Err(e) = client.start().await {
-                error!("❌ Помилка запуску клієнта: {:?}", e);
+            // Reconnection supervisor: serenity already auto-reconnects on
+            // transient gateway drops, but if `start()` ever returns we restart
+            // it with capped exponential backoff so the bot keeps running
+            // instead of exiting on a recoverable failure.
+            let mut backoff = 5u64;
+            loop {
+                info!("🔌 Підключення до Discord...");
+                match client.start().await {
+                    Ok(()) => {
+                        warn!("⚠️ Клієнт зупинився, перепідключення...");
+                        backoff = 5;
+                    }
+                    Err(e) => {
+                        error!("❌ Помилка роботи клієнта: {:?}", e);
+                    }
+                }
+                warn!("🔁 Повторне підключення через {} сек...", backoff);
+                time::sleep(Duration::from_secs(backoff)).await;
+                backoff = (backoff * 2).min(300);
             }
         }
         Err(e) => {
             error!("❌ Не вдалося створити клієнт: {:?}", e);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_env;
+
+    #[test]
+    fn parses_plain_key_values() {
+        let pairs = parse_env("DISCORD_TOKEN=abc123\nADMIN_ID=42\n");
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(
+            pairs[0],
+            ("DISCORD_TOKEN".to_string(), "abc123".to_string())
+        );
+        assert_eq!(pairs[1], ("ADMIN_ID".to_string(), "42".to_string()));
+    }
+
+    #[test]
+    fn handles_comments_blanks_quotes_bom_crlf_and_export() {
+        let input = "\u{feff}# comment\r\n\r\nexport DISCORD_TOKEN=\"tok\"\r\nADMIN_ID='99'\r\n";
+        let pairs = parse_env(input);
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0], ("DISCORD_TOKEN".to_string(), "tok".to_string()));
+        assert_eq!(pairs[1], ("ADMIN_ID".to_string(), "99".to_string()));
     }
 }
